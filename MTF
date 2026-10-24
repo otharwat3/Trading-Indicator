@@ -1,0 +1,1400 @@
+// © 2025 — Multi-Timeframe CTF/ETF Indicator (Active Preset Only)
+// Pine Script™ v5
+//@version=5
+indicator("MTF CTF/ETF (Active Preset Only) — with Debug",
+     overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500, max_bars_back=5000)
+
+//=============================//
+//========= INPUTS ============//
+//=============================//
+// Restrict entries to first HALF of the active price box (by price)
+restrict_first_half_price = input.bool(false, "ETF entry allowed only in FIRST HALF of price box?")
+min_rr_to_take = input.float(4.0, "Min possible RR to take trade (TP distance in R)", step=0.25, minval=0.0)
+
+// === Global additions ===
+eval_on_entry_bar = input.bool(true, "Allow TP/SL on entry bar?")
+
+// If you want to limit how old a signal can be when taking entry:
+max_sig_age = input.int(5, "Max bars since signal to allow entry", minval=1)
+
+// Per-trade storage for box-edge TP (used by both modules)
+var float[] a_tpBox = array.new_float()
+
+// Tie handling
+tieMode = input.string("Pessimistic", "Same-candle tie handling", options = ["Pessimistic", "Optimistic"],
+  tooltip = "اختيار نتيجة التعادل عندما يُلمس كل من TP و SL في نفس شمعة ETF: Optimistic = نحسب TP، Pessimistic = نحسب SL.")
+
+// == NEW ==
+paint_ctf_on_etf = input.bool(true, "Paint ETF background when CTF signal is active?")
+require_align     = input.bool(true, "Require ETF signal same direction as CTF?")
+
+// PB detection controls
+pb_require_opposite_close = input.bool(false,  "PB must be opposite-color candle?")
+pb_use_close              = input.bool(true, "PB uses CLOSE instead of wick?")
+pb_must_within_bars       = input.int(2, "PB must occur within M bars after signal", minval=1,
+  tooltip="If a pullback of the required size doesn’t occur within M bars after the ETF signal, the window is closed as No PB (no entry, no BE).")
+
+// Timeframes (hardcoded)
+ctf_tf = "30"   // 30 Minutes
+etf_tf = "3"    // 3 Minutes
+
+// بدون مقارنات نصية
+isCTF0 = (timeframe.isminutes and timeframe.multiplier == 30)  // 30m chart
+isETF0 = (timeframe.isminutes and timeframe.multiplier == 3)   // 3m chart
+
+// النتيجة النهائية
+isCTF = isCTF0
+isETF = isETF0
+
+// EMAs & ATR
+emaFast = input.int(10, "EMA Fast", minval=1)
+emaMid  = input.int(20, "EMA Mid",  minval=1)
+emaSlow = input.int(50, "EMA Slow", minval=1)
+atrLen  = input.int(14, "ATR Length (RMA)", minval=1)
+
+// Active preset — tunable
+ang10L = input.float( 6.0, "Angle 10 L", step=0.5)
+ang20L = input.float( 3.0, "Angle 20 L", step=0.5)
+ang50L = input.float( 0.0, "Angle 50 L", step=0.5)
+ang10S = input.float(-6.0, "Angle 10 S", step=0.5)
+ang20S = input.float(-3.0, "Angle 20 S", step=0.5)
+ang50S = input.float( 0.0, "Angle 50 S", step=0.5)
+
+// Optional same-direction candle for CTF signal bar
+reqDirCTF = input.bool(true, "CTF requires same-direction candle?")
+
+// Module toggles
+show_mod1 = input.bool(true,  "Module 1 — Valid Area (CTF)", inline="M1")
+show_mod2 = input.bool(true,  "Module 2 — Entry Confirm (ETF)", inline="M2")
+show_mod3 = input.bool(true,  "Module 3 — Trade Mgmt (ETF)", inline="M3")
+show_mod4 = input.bool(true,  "Module 4 — Backtesting", inline="M4")
+show_mod5 = input.bool(true,  "Module 5 — Results Tables", inline="M5")
+
+// Module 1 — Valid Area (CTF) parameters
+area_bars    = input.int(12,  "Area window (CTF bars)")
+inv_bars     = input.int(3,   "Invalidation: consecutive opposite closes")
+bandMultHi   = input.float(1.0, "Band hi mult (× body)", step=0.05)
+bandMultLo   = input.float(1.0, "Band lo mult (× body)", step=0.05)
+bandOffTicks = input.int(0,     "Band offset (ticks)", tooltip="Offset both band edges by this many ticks (signed)")
+
+// Module 2 — Entry Confirmation (ETF) parameters
+bodyMinATR    = input.float(0.05, "Body filter (ATR multiples) — ETF", step=0.05, tooltip="Require ETF bar body >= bodyMinATR * ATR(ETF)")
+ctfBodyMinATR = input.float(0.5,  "Body filter (ATR multiples) — CTF", step=0.05, tooltip="Require CTF bar body >= ctfBodyMinATR * ATR(CTF). Set 0 to disable.")
+pullbackAtr   = input.float(0.0, "Pullback size (ATR multiples)", step=0.05)
+fillPolicy    = input.string("Touch", "Fill policy", options=["Touch","Close"], tooltip="Touch = intrabar touch; Close = bar close at level")
+require_in_box = input.bool(false, "Require ETF signal inside active price box?")
+
+// === Entry-after-pullback controls ===
+enter_after_pb       = input.bool(true,  "Enter AFTER pullback at ETF signal price (retest)")
+require_resume_cndl  = input.bool(false, "Require resume candle direction on entry?")
+
+// MOD: Universal wait after PB to prevent same-candle PB & entry
+// MOD: allow same-candle PB & entry by permitting 0
+min_pb_wait_bars = input.int(1, "Bars to wait after PB before entry", minval = 0,
+  tooltip = "0 = allow same-candle PB & entry (PB detected and price retests SignalPx in the same bar).")
+
+// === ETF multi-entry controls ===
+etf_multiMode        = input.string("Once", "ETF multi-entry mode", options = ["Once", "Per Bar", "Cooldown M bars", "Up to N"])
+etf_cooldownBars     = input.int(3, "ETF cooldown M (bars)", minval=1)
+etf_maxPerSignal     = input.int(5, "ETF max N per CTF signal", minval=1)
+etf_minSpacingTicks  = input.int(0, "Min spacing between entries (ticks)", minval=0)
+pbMode               = input.string("Required", "ETF pullback filter", options=["Required","Optional","Off"], tooltip="This build enforces pullback anyway.")
+
+// Module 3 — Trade Management (ETF)
+rr_tp         = input.float(1.0, "Take Profit R", step=0.1, minval=0.1)
+be_at_R       = input.float(0.4, "Move to BE at +R", step=0.05, minval=0.05)
+partialBE_on  = input.bool(false, "Partial at BE?")
+partialBE_pct = input.float(50, "Partial % at BE", step=5, minval=5, maxval=95)
+slBufTicks    = input.int(0, "SL buffer (ticks, adds for SL distance)")
+pyramidN      = input.int(10, "Pyramiding (max concurrent entries)", minval=1, maxval=10)
+
+// NEW: TP mode (UI preserved; logic is forced to Box Edge internally below)
+tp_mode = input.string("Box Edge", "TP mode", options=["R Multiple","Box End","Box Edge"])
+
+// === NEW: BE mode toggle ===
+enable_be_mode = input.bool(false, "Enable Break-Even Mode (move SL to BE)", tooltip="If OFF: no BE move and no partial-on-BE.")
+
+// Module 4 — Backtesting
+ctf_start      = input.time(timestamp("2025-12-01T00:00:00"), "CTF backtest start (exchange time)")
+entry_windowN  = input.int(60, "ETF backtest: entry window N (ETF bars)", minval=1)
+feeR           = input.float(0.0, "Fees/Slippage per round trip (in R)", step=0.01, tooltip="Applied per completed trade")
+enable_bt_calc = input.bool(true, "Enable Backtest Accounting", tooltip="If OFF: stats counters do not change (visuals still draw).")
+
+// Colors & styles
+colLong    = input.color(color.new(color.lime, 0), "Long color")
+colShort   = input.color(color.new(color.red,  0), "Short color")
+colNeutral = input.color(color.new(color.gray, 30), "Neutral color")
+labStyle   = input.string("Label", "Label style", options=["Label","Tag"])
+_lstyle    = labStyle == "Tag" ? label.style_label_up : label.style_label_center
+
+// ===== New Inputs for Active Source & Painting =====
+active_src      = input.string("Chart-time (timestamps)", "Active area source", options=["CTF flag", "Chart-time (timestamps)"])
+paint_on_any_tf = input.bool(false, "Paint CTF Active on any TF? (default: ETF only)")
+
+// ===== DEBUG Inputs =====
+dbg_on               = input.bool(true,  "DEBUG mode (show helpers)")
+dbg_loosen_pulses    = input.bool(true,  "DEBUG: count pulses even if not on ETF/active")
+// IMPORTANT: default false to prevent accidental all-TF painting
+dbg_paint_any_tf_dbg = input.bool(false, "DEBUG: force paint on ANY TF")
+dbg_use_chart_time   = input.bool(true,  "DEBUG: compute active via timestamps")
+
+//=============================//
+//===== HELPER FUNCTIONS ======//
+//=============================//
+
+mintick() => syminfo.mintick
+ticksToPrice(t) => t * mintick()
+
+// Declarative labels
+verbose_labels = input.bool(true, "Verbose event labels (declarative)")
+sideTxt(s) => s == 1 ? "LONG" : s == -1 ? "SHORT" : "—"
+pfmt(x)    => str.tostring(x)
+labClr(kind) =>
+     kind == "sig"       ? color.new(color.red, 0) :
+     kind == "entry"     ? color.new(color.lime, 0) :
+     kind == "pb"        ? color.new(color.black, 0) :
+     kind == "nopb"      ? color.new(color.orange, 0) :
+     kind == "be"        ? color.new(color.blue, 0) :
+     kind == "tp"        ? color.new(color.green, 0) :
+     kind == "sl"        ? color.new(color.red, 0) :
+     kind == "autoclose" ? color.new(color.orange, 0) :
+     kind == "boxopen"   ? color.new(color.teal, 0) :
+     kind == "boxclose"  ? color.new(color.orange, 0) :
+     kind == "tplvl"     ? color.new(color.green, 40) :
+     kind == "sllvl"     ? color.new(color.red,   40) :
+     kind == "res_hit"   ? color.new(color.green, 0) :
+     kind == "res_fail"  ? color.new(color.red,   0) :
+     kind == "res_be"    ? color.new(color.blue,  0) :
+     color.new(color.gray, 0)
+
+labText(kind, s, extras) =>
+    kind == "sig"       ? "Signal "+ sideTxt(s) + (extras != "" ? "\n" + extras : "") :
+     kind == "pb"        ? "Pb":
+     kind == "nopb"      ? "NO ENTRY":
+     kind == "entry"     ? "ENTRY (" + sideTxt(s) + ")\n" + extras :
+     kind == "be"        ? "Moved to BREAK-EVEN\n":
+     kind == "tp"        ? "TAKE PROFIT\n" + extras :
+     kind == "sl"        ? "STOP LOSS\n" + extras :
+     kind == "autoclose" ? "Auto-Close (window ended)\n" + extras :
+     kind == "boxopen"   ? "Box Open (" + sideTxt(s) + ")" :
+     kind == "boxclose"  ? "Box Close — " + extras :
+     kind == "tplvl"     ? "TP @ " + extras :
+     kind == "sllvl"     ? "SL @ " + extras :
+     kind == "res_hit"   ? "RESULT: HIT\n" + extras :
+     kind == "res_fail"  ? "RESULT: FAIL\n" + extras :
+     kind == "res_be"    ? "RESULT: BE\n" + extras :
+     extras
+
+makeLabel(x, y, kind, s, extras) =>
+    label.new(x, y,
+      verbose_labels ? labText(kind, s, extras)
+                     : (kind == "sig" ? (s==1?"Sig L":"Sig S")
+                       : kind == "pb"   ? "PB"
+                       : kind == "nopb" ? "No PB"
+                       : kind == "entry"? (s==1?"L":"S")
+                       : kind == "be"   ? "BE"
+                       : kind == "tp"   ? "TP"
+                       : kind == "sl"   ? "SL"
+                       : kind == "boxopen" ? "Box Open"
+                       : kind == "boxclose"? "Box Close"
+                       : kind == "tplvl" ? "TP"
+                       : kind == "sllvl" ? "SL"
+                       : kind == "res_hit" ? "HIT"
+                       : kind == "res_fail"? "FAIL"
+                       : kind == "res_be"  ? "BE" : kind),
+      style=_lstyle, textcolor=color.white, color=labClr(kind))
+
+// min non-na
+f_min_int(a, b) =>
+    na(a) ? b : na(b) ? a : math.min(a, b)
+
+ema_tf(tf, len) => request.security(syminfo.tickerid, tf, ta.ema(close, len), barmerge.gaps_off, barmerge.lookahead_off)
+atr_tf(tf, len) => request.security(syminfo.tickerid, tf, ta.atr(len),      barmerge.gaps_off, barmerge.lookahead_off)
+
+angle_tf(tf, len) =>
+    _ema = ema_tf(tf, len)
+    _atr = atr_tf(tf, atrLen)
+    100.0 * (_ema - _ema[1]) / _atr
+
+//=============================//
+//==== CTF/ETF core fields ====//
+//=============================//
+
+ctxLong_tf(tf) =>
+    a10 = angle_tf(tf, emaFast)
+    a20 = angle_tf(tf, emaMid)
+    a50 = angle_tf(tf, emaSlow)
+    dirCandle = request.security(syminfo.tickerid, tf, close > open, barmerge.gaps_off, barmerge.lookahead_off)
+    (a10 >= ang10L and a20 >= ang20L and a50 >= ang50L) and dirCandle
+
+ctxShort_tf(tf) =>
+    a10 = angle_tf(tf, emaFast)
+    a20 = angle_tf(tf, emaMid)
+    a50 = angle_tf(tf, emaSlow)
+    dirCandle = request.security(syminfo.tickerid, tf, close < open, barmerge.gaps_off, barmerge.lookahead_off)
+    (a10 <= ang10S and a20 <= ang20S and a50 <= ang50S) and dirCandle
+
+// Core CTF stateless fields via security (ETF-safe)
+f_ctf_field(tf, field) =>
+    _e10 = ta.ema(close, emaFast)
+    _e20 = ta.ema(close, emaMid)
+    _e50 = ta.ema(close, emaSlow)
+    _atr = ta.atr(atrLen)
+    _a10 = 100.0 * (_e10 - _e10[1]) / _atr
+    _a20 = 100.0 * (_e20 - _e20[1]) / _atr
+    _a50 = 100.0 * (_e50 - _e50[1]) / _atr
+
+    _bodyAbs = math.abs(close - open)
+    _ctfOK   = ctfBodyMinATR <= 0.0 ? true : (_bodyAbs >= ctfBodyMinATR * _atr)
+
+    _dirOkL  = (not reqDirCTF) or (close > open)
+    _dirOkS  = (not reqDirCTF) or (close < open)
+    _sigL    = (_a10 >= ang10L and _a20 >= ang20L and _a50 >= ang50L) and _dirOkL and _ctfOK
+    _sigS    = (_a10 <= ang10S and _a20 <= ang20S and _a50 <= ang50S) and _dirOkS and _ctfOK
+    _sdir    = _sigL ? 1 : _sigS ? -1 : 0
+
+    _sdirPrev       = nz(_sdir[1], 0)
+    _sigPulseEdge   = (_sdir != 0) and (_sdirPrev == 0)
+    _sigPulseSigned = _sigPulseEdge ? _sdir : 0
+
+    _lastD = ta.valuewhen(_sigPulseEdge, _sdir, 0)
+    _sCls  = ta.valuewhen(_sigPulseEdge, close, 0)
+    _sBod  = ta.valuewhen(_sigPulseEdge, math.abs(close - open), 0)
+
+    _bs  = ta.barssince(_sigPulseEdge)
+    _has = not na(_bs)
+
+    _hiMul = _sBod * bandMultHi
+    _loMul = _sBod * bandMultLo
+    _off   = ticksToPrice(bandOffTicks)
+    _bLo   = _lastD == 1 ? _sCls - 0.0 + _off : _sCls - _loMul + _off
+    _bHi   = _lastD == 1 ? _sCls + _hiMul + _off : _sCls + 0.0   + _off
+    _tgt   = _lastD == 1 ? (_sCls + _sBod) : (_sCls - _sBod)
+
+    _lenEx = (_has and _bs >= 1) ? _bs : 0
+    _hEx   = (_lenEx >= 1) ? ta.highest(high, _lenEx) : na
+    _lEx   = (_lenEx >= 1) ? ta.lowest (low,  _lenEx) : na
+
+    _oppNow   = _lastD == 1 ? (close < open) : (close > open)
+    _oppAfter = (_has and _bs >= 1) ? _oppNow : false
+    _oppStk   = (_has and _bs >= 1) ? (ta.barssince(not _oppAfter) + 1) : 0
+
+    _hitWithinM = _bs >= 1 and _bs <= area_bars
+    _invWithinN = _bs >= 1 and _bs <= inv_bars
+
+    _hitNow   = _has and _hitWithinM and (_lastD == 1 ? (_hEx >= _tgt) : (_lEx <= _tgt))
+    _tHit     = ta.valuewhen(_hitNow and not _hitNow[1], time, 0)
+
+    _invOppNow = _has and _invWithinN and (_oppStk >= inv_bars)
+    _tInvOpp   = ta.valuewhen(_invOppNow and not _invOppNow[1], time, 0)
+
+    _invTimeNow = _has and (_bs > area_bars) and not _hitNow
+    _tInvTime   = ta.valuewhen(_invTimeNow and not _invTimeNow[1], time, 0)
+
+    _tInvAny  = na(_tInvOpp) ? _tInvTime : na(_tInvTime) ? _tInvOpp : math.min(_tInvOpp, _tInvTime)
+    _hitWins  = not na(_tHit) and (na(_tInvAny) or _tHit <= _tInvAny)
+    _tgtHitWin= _hitWins and time >= _tHit
+    _invAny   = (not _hitWins) and not na(_tInvAny) and time >= _tInvAny
+
+    _tgtPulse = _tgtHitWin and not _tgtHitWin[1]
+    _invPulse = _invAny    and not _invAny[1]
+    _sigPulse = _sigPulseEdge
+
+    _activeNow = (_bs >= 1) and not (_tgtHitWin or _invAny)
+
+    field == 0  ? _lastD :
+     field == 1  ? _sCls  :
+     field == 2  ? _sBod  :
+     field == 3  ? _bLo   :
+     field == 4  ? _bHi   :
+     field == 5  ? (_activeNow ? 1.0 : 0.0) :
+     field == 6  ? (_tgtPulse ? 1.0 * _lastD : 0.0) :
+     field == 7  ? (_invPulse ? 1.0 * _lastD : 0.0) :
+     field == 8  ? (_sigPulse ? 1.0 * _sigPulseSigned : 0.0) :
+     field == 9  ? _tgt     :
+     field == 10 ? _bs      :
+     field == 11 ? (_invTimeNow ? 1.0 : 0.0) :
+     field == 12 ? (_invOppNow  ? 1.0 : 0.0) :
+     field == 13 ? (_tgtHitWin  ? 1.0 : 0.0) :
+     field == 14 ? ta.valuewhen(_sigPulseEdge, time, 0) :
+     field == 15 ? _tHit :
+     field == 16 ? _tInvAny :
+     na
+
+// ETF edge pulse
+f_etf_pulse(tf) =>
+    _e10 = ta.ema(close, emaFast)
+    _e20 = ta.ema(close, emaMid)
+    _e50 = ta.ema(close, emaSlow)
+    _atr = ta.atr(atrLen)
+
+    _a10 = 100.0 * (_e10 - _e10[1]) / _atr
+    _a20 = 100.0 * (_e20 - _e20[1]) / _atr
+    _a50 = 100.0 * (_e50 - _e50[1]) / _atr
+
+    _bodyAbs = math.abs(close - open)
+    _bodyOK  = (_bodyAbs >= bodyMinATR * _atr)
+
+    _sigL = (_a10 >= ang10L and _a20 >= ang20L and _a50 >= ang50L) and (close > open) and _bodyOK
+    _sigS = (_a10 <= ang10S and _a20 <= ang20S and _a50 <= ang50S) and (close < open) and _bodyOK
+    _sdir = _sigL ? 1 : _sigS ? -1 : 0
+
+    _prev = nz(_sdir[1], 0)
+    _edge = (_sdir != 0) and (_prev == 0)
+    _edge ? _sdir : 0
+
+safeLen(n) => math.min(n, bar_index + 1)
+bi_from_ts(ts) =>
+    na(ts) ? na : ta.valuewhen(time >= ts, bar_index, 0)
+
+//=============================//
+//==== Pull CTF/ETF series ====//
+//=============================//
+
+// CTF pulls
+ctf_dir     = request.security(syminfo.tickerid, ctf_tf, f_ctf_field(ctf_tf, 0),  barmerge.gaps_off, barmerge.lookahead_off)
+ctf_sigPx   = request.security(syminfo.tickerid, ctf_tf, f_ctf_field(ctf_tf, 1),  barmerge.gaps_off, barmerge.lookahead_off)
+ctf_sigBody = request.security(syminfo.tickerid, ctf_tf, f_ctf_field(ctf_tf, 2),  barmerge.gaps_off, barmerge.lookahead_off)
+ctf_bandLo  = request.security(syminfo.tickerid, ctf_tf, f_ctf_field(ctf_tf, 3),  barmerge.gaps_off, barmerge.lookahead_off)
+ctf_bandHi  = request.security(syminfo.tickerid, ctf_tf, f_ctf_field(ctf_tf, 4),  barmerge.gaps_off, barmerge.lookahead_off)
+ctf_activeS = request.security(syminfo.tickerid, ctf_tf, f_ctf_field(ctf_tf, 5),  barmerge.gaps_off, barmerge.lookahead_off)
+ctf_tgtP    = request.security(syminfo.tickerid, ctf_tf, f_ctf_field(ctf_tf, 6),  barmerge.gaps_off, barmerge.lookahead_off)
+ctf_invP    = request.security(syminfo.tickerid, ctf_tf, f_ctf_field(ctf_tf, 7),  barmerge.gaps_off, barmerge.lookahead_off)
+ctf_sigP    = request.security(syminfo.tickerid, ctf_tf, f_ctf_field(ctf_tf, 8),  barmerge.gaps_off, barmerge.lookahead_off)
+ctf_target  = request.security(syminfo.tickerid, ctf_tf, f_ctf_field(ctf_tf, 9),  barmerge.gaps_off, barmerge.lookahead_off)
+ctf_barsSn  = request.security(syminfo.tickerid, ctf_tf, f_ctf_field(ctf_tf,10),  barmerge.gaps_off, barmerge.lookahead_off)
+ctf_invTime = request.security(syminfo.tickerid, ctf_tf, f_ctf_field(ctf_tf,11),  barmerge.gaps_off, barmerge.lookahead_off)
+ctf_invOpp  = request.security(syminfo.tickerid, ctf_tf, f_ctf_field(ctf_tf,12),  barmerge.gaps_off, barmerge.lookahead_off)
+ctf_tgtHit  = request.security(syminfo.tickerid, ctf_tf, f_ctf_field(ctf_tf,13),  barmerge.gaps_off, barmerge.lookahead_off)
+ctf_tSig    = request.security(syminfo.tickerid, ctf_tf, f_ctf_field(ctf_tf,14),  barmerge.gaps_off,  barmerge.lookahead_off)
+ctf_tHit    = request.security(syminfo.tickerid, ctf_tf, f_ctf_field(ctf_tf,15),  barmerge.gaps_off,  barmerge.lookahead_off)
+ctf_tInv    = request.security(syminfo.tickerid, ctf_tf, f_ctf_field(ctf_tf,16),  barmerge.gaps_off,  barmerge.lookahead_off)
+float boxMid = (ctf_sigPx + ctf_target) / 2.0
+
+// ==== Cast timestamps from CTF to int (ms)
+ts_sig = int(ctf_tSig)
+ts_hit = na(ctf_tHit) ? na : int(ctf_tHit)
+ts_inv = na(ctf_tInv) ? na : int(ctf_tInv)
+
+// ---- Entry range (visual only) ----
+longLo  = math.min(ctf_sigPx, ctf_target)
+longHi  = math.max(ctf_sigPx, ctf_target)
+shortLo = math.min(ctf_target, ctf_sigPx)
+shortHi = math.max(ctf_sigPx, ctf_target)
+barTouchesRange(lo, hi) => (high >= lo and low <= hi)
+closeInRange(lo, hi)    => (close >= lo and close <= hi)
+
+// ===== Helper: inside active price box (for gating ETF signals) =====
+f_inside_active_price_box() =>
+    _lo = math.min(ctf_sigPx, ctf_target)
+    _hi = math.max(ctf_sigPx, ctf_target)
+    (high >= _lo) and (low <= _hi)
+
+//=============================//
+//==== CTF Stats + Backtest ====//
+//=============================//
+
+var int  ctf_sigCount         = 0
+var int  ctf_hitCount         = 0
+var int  ctf_invalidCount     = 0
+var int  ctf_timeoutFailCount = 0
+var int  ctf_failCount        = 0
+ctfInBacktest = time >= ctf_start
+etfInBacktest = time >= ctf_start
+
+ctf_active = ctf_activeS > 0.5
+ctfLong    = ctf_dir == 1
+ctfShort   = ctf_dir == -1
+
+//=============================//
+//== Active window (chart-time)//
+//=============================//
+
+var int ETFS_MS = int(timeframe.in_seconds(etf_tf)) * 1000
+var int CTFS_MS = int(timeframe.in_seconds(ctf_tf)) * 1000
+barEnd(ts) => ts + ETFS_MS
+
+// FIX: make chart-time active gating deterministic (remove broken next-signal logic)
+int r_now = barEnd(time)
+int t_sig = int(ctf_tSig)
+int t_timeout = na(t_sig) ? na : t_sig + area_bars * CTFS_MS
+int t_hit_close = na(ctf_tHit) or (int(ctf_tHit) < t_sig) ? na : int(ctf_tHit) + CTFS_MS
+int t_inv_close = na(ctf_tInv) or (int(ctf_tInv) < t_sig) ? na : int(ctf_tInv) + CTFS_MS
+int t_end_evt = f_min_int(t_hit_close, t_inv_close)
+t_end_evt := f_min_int(t_end_evt, t_timeout)
+bool ctf_active_chart = not na(t_sig) and (r_now > t_sig) and (r_now <= (na(t_end_evt) ? t_timeout : t_end_evt))
+
+//=============================//
+//======== ETF Context =========//
+//=============================//
+
+etf_a10 = angle_tf(etf_tf, emaFast)
+etf_a20 = angle_tf(etf_tf, emaMid)
+etf_a50 = angle_tf(etf_tf, emaSlow)
+etf_body = request.security(syminfo.tickerid, etf_tf, math.abs(close - open), barmerge.gaps_off, barmerge.lookahead_off)
+etf_atr  = atr_tf(etf_tf, atrLen)
+etf_ctxLong  = (etf_a10 >= ang10L and etf_a20 >= ang20L and etf_a50 >= ang50L) and (close > open) and (etf_body >= bodyMinATR * etf_atr)
+etf_ctxShort = (etf_a10 <= ang10S and etf_a20 <= ang20S and etf_a50 <= ang50S) and (close < open) and (etf_body >= bodyMinATR * etf_atr)
+etf_ctxDir   = etf_ctxLong ? 1 : etf_ctxShort ? -1 : 0
+
+//=============================//
+//======== MODULE 1 ===========//
+//==== Valid Area (CTF) =======//
+//=============================//
+
+if show_mod1 and isCTF and barstate.isconfirmed
+    if ctf_sigP != 0
+        if enable_bt_calc and ctfInBacktest
+            ctf_sigCount += 1
+        makeLabel(bar_index, ctf_sigPx, "sig", ctf_sigP > 0 ? 1 : -1, "CTF SignalPx " + pfmt(ctf_sigPx))
+        line.new(bar_index, ctf_bandLo, bar_index, ctf_bandHi, extend=extend.none,
+                 color = ctf_sigP > 0 ? color.new(colLong, 60) : color.new(colShort, 60), width=2)
+        makeLabel(bar_index, ctf_target, "tp", ctf_sigP > 0 ? 1 : -1, "Target " + pfmt(ctf_target))
+
+var int[]   q_time  = array.new_int()
+var float[] q_sigPx = array.new_float()
+var float[] q_tgt   = array.new_float()
+var int[]   q_dir   = array.new_int()
+var int[]   q_bs    = array.new_int()
+var bool[]  q_hit   = array.new_bool()
+var bool[]  q_done  = array.new_bool()
+
+if show_mod1 and isCTF and barstate.isconfirmed
+    hitN    = math.max(1, area_bars)
+    invNraw = math.max(1, inv_bars)
+    invN    = math.min(invNraw, hitN)
+
+    if ctf_sigP != 0
+        array.push(q_time,  time)
+        array.push(q_sigPx, ctf_sigPx)
+        array.push(q_tgt,   ctf_target)
+        array.push(q_dir,   int(ctf_dir))
+        array.push(q_bs,    0)
+        array.push(q_hit,   false)
+        array.push(q_done,  false)
+
+    sz = array.size(q_time)
+    if sz > 0
+        for i = 0 to sz - 1
+            if not array.get(q_done, i) and array.get(q_time, i) != time
+                array.set(q_bs, i, array.get(q_bs, i) + 1)
+
+    if sz > 0
+        for i = 0 to sz - 1
+            if array.get(q_done, i)
+                continue
+            bs  = array.get(q_bs,  i)
+            dir = array.get(q_dir, i)
+            px  = array.get(q_sigPx, i)
+            tgt = array.get(q_tgt,   i)
+
+            invalidNow = (bs == invN) and ((dir > 0 and ta.highest(close, invN) <= px) or (dir < 0 and ta.lowest(close, invN) >= px))
+            hitNow     = (bs >= 1 and bs <= hitN) and ((dir > 0 and high >= tgt) or (dir < 0 and low <= tgt))
+            if hitNow
+                array.set(q_hit, i, true)
+            failNow = (bs == hitN) and (not array.get(q_hit, i)) and (not invalidNow)
+
+            if hitNow
+                y = tgt + (dir > 0 ? ticksToPrice(2) : -ticksToPrice(2))
+                makeLabel(bar_index, y, "tp", dir, "Target hit @ " + pfmt(tgt))
+                if enable_bt_calc and ctfInBacktest
+                    ctf_hitCount += 1
+                array.set(q_done, i, true)
+            else if invalidNow
+                y = px + (dir > 0 ? ticksToPrice(2) : -ticksToPrice(2))
+                makeLabel(bar_index, y, "sl", dir, "Invalidated at band")
+                if enable_bt_calc and ctfInBacktest
+                    ctf_invalidCount += 1
+                array.set(q_done, i, true)
+            else if failNow
+                y = px + (dir > 0 ? ticksToPrice(2) : -ticksToPrice(2))
+                makeLabel(bar_index, y, "autoclose", dir, "Timed out")
+                if enable_bt_calc and ctfInBacktest
+                    ctf_timeoutFailCount += 1
+                array.set(q_done, i, true)
+
+        // FIX: prevent negative indices / empty-array reverse loop errors
+        int qsz = array.size(q_time)
+        if qsz > 0
+            for k = qsz - 1 to 0
+                if array.get(q_done, k) and array.get(q_bs, k) > hitN
+                    array.remove(q_time,  k)
+                    array.remove(q_sigPx, k)
+                    array.remove(q_tgt,   k)
+                    array.remove(q_dir,   k)
+                    array.remove(q_bs,    k)
+                    array.remove(q_hit,   k)
+                    array.remove(q_done,  k)
+
+//=============================//
+//== PRE-DECLARE TRADE STATE ==//
+//=============================//
+
+var float[]  a_entry   = array.new_float()
+var float[]  a_sl      = array.new_float()
+var float[]  a_tp      = array.new_float()
+var int[]    a_side    = array.new_int()
+var int[]    a_state   = array.new_int() // 0 open, 1 win, -1 loss, 2 BE, 3 auto/flip/box
+var int[]    a_openBi  = array.new_int()
+var bool[]   a_beSet   = array.new_bool()
+var float[]  a_Rsize   = array.new_float()
+var float[]  a_partial = array.new_float()
+var int[]    a_sigIdx  = array.new_int()
+var bool[]   a_accounted = array.new_bool()
+
+// Backtest counters (ETF)
+var int[]   _winsArr   = array.new_int(1, 0)
+var int[]   _lossArr   = array.new_int(1, 0)
+var int[]   _beArr     = array.new_int(1, 0)
+var float[] _totalRArr = array.new_float(1, 0.0)
+
+// Modular backtest helpers
+bt_enabled() =>
+    show_mod4 and enable_bt_calc and etfInBacktest
+
+bt_add(win, loss, be, r_delta) =>
+    if bt_enabled()
+        array.set(_winsArr, 0, array.get(_winsArr, 0) + win)
+        array.set(_lossArr, 0, array.get(_lossArr, 0) + loss)
+        array.set(_beArr,   0, array.get(_beArr,   0) + be)
+        array.set(_totalRArr, 0, array.get(_totalRArr, 0) + r_delta)
+
+bt_totals() =>
+    [array.get(_winsArr, 0), array.get(_lossArr, 0), array.get(_beArr, 0), array.get(_totalRArr, 0)]
+
+//=============================//
+//======== MODULE 2 ===========//
+//== Entry Confirmation (ETF) =//
+//=============================//
+
+// Opacity UI
+bgOpacity  = input.int(70, "ETF background opacity (0=transparent, 100=solid)", minval=0, maxval=100)
+boxOpacity = input.int(70, "Box fill opacity (0=transparent, 100=solid)",      minval=0, maxval=100)
+bgTransp   = 100 - bgOpacity
+boxTransp  = 100 - boxOpacity
+
+// unified active source
+ctf_active_final = active_src == "CTF flag" ? (ctf_activeS > 0.5) : ctf_active_chart
+act_gate = ctf_active_final and (ctf_dir != 0)
+
+// NEW: Only allow trading AFTER the CTF invalidation phase is fully passed
+// ctf_barsSn is "CTF bars since signal edge" from f_ctf_field(..., 10)
+bool ctf_passed_inv_phase = not na(ctf_barsSn) and (ctf_barsSn > inv_bars)
+
+// Entry eligibility gate (keeps visuals intact elsewhere)
+bool entry_gate_ctf_validated = act_gate and ctf_passed_inv_phase
+
+// signal gating
+etf_sigP = request.security(syminfo.tickerid, etf_tf, f_etf_pulse(etf_tf), barmerge.gaps_off, barmerge.lookahead_off)
+etf_sigEdge_raw = isETF and barstate.isconfirmed and (etf_sigP != 0)
+align_ok        = not require_align or (ctf_dir == etf_sigP)
+in_box_ok       = not require_in_box or f_inside_active_price_box()
+
+// FIX: require a valid CTF signal timestamp when creating / processing ETF windows
+etf_sigEdge     = show_mod2 and etf_sigEdge_raw and align_ok and in_box_ok and entry_gate_ctf_validated
+
+// DEBUG
+plotchar(isETF and barstate.isconfirmed and (etf_sigP != 0), title="ETF pulse", char="•", location=location.bottom, size=size.tiny)
+plotchar(align_ok,    title="align_ok",    char="=", location=location.bottom, size=size.tiny)
+plotchar(in_box_ok,   title="in_box_ok",   char="□", location=location.bottom, size=size.tiny)
+plotchar(act_gate,    title="active_gate", char="A", location=location.bottom, size=size.tiny)
+
+//=============================//
+//======== ETF WINDOWS =========//
+//======= Declarations =========//
+//=============================//
+
+var int[]   s_time    = array.new_int()
+var int[]   s_side    = array.new_int()
+var float[] s_close   = array.new_float()
+var float[] s_open    = array.new_float()
+var int[]   s_bs      = array.new_int()
+var bool[]  s_pbOK    = array.new_bool()
+var bool[]  s_entered = array.new_bool()
+var bool[]  s_touched = array.new_bool()
+var bool[]  s_done    = array.new_bool()
+var int[]   s_pbOK_bi = array.new_int()
+var bool[]  s_armed   = array.new_bool()
+
+// (UI/legacy arrays preserved; no longer used for gating)
+// NEW: per-window entry control (legacy)
+var int[]   s_entryCount   = array.new_int()
+var int[]   s_lastEntryBi  = array.new_int()
+var float[] s_lastEntryPx  = array.new_float()
+
+var int etf_sigEval = 0
+var int etf_noEntry = 0
+var int etf_touched_noEntry = 0
+var int etf_touched_total   = 0
+
+var int[] s_ctfSigTs = array.new_int()
+
+//=============================//
+//== MULTI-ENTRY PER CTF FIX ==//
+//=============================//
+
+// FIX: track multi-entry state PER CTF SIGNAL (keyed by CTF signal timestamp)
+var int[]   ctf_keys_ts      = array.new_int()
+var int[]   ctf_entryCount   = array.new_int()
+var int[]   ctf_lastEntryBi  = array.new_int()
+var float[] ctf_lastEntryPx  = array.new_float()
+
+f_ctf_track_find(ts0) =>
+    int idx = na
+    int n = array.size(ctf_keys_ts)
+    if n > 0 and not na(ts0)
+        for j = 0 to n - 1
+            if array.get(ctf_keys_ts, j) == ts0
+                idx := j
+                break
+    idx
+
+f_ctf_track_ensure(ts0) =>
+    int idx = f_ctf_track_find(ts0)
+    if na(idx) and not na(ts0)
+        array.push(ctf_keys_ts, ts0)
+        array.push(ctf_entryCount, 0)
+        array.push(ctf_lastEntryBi, na)
+        array.push(ctf_lastEntryPx, na)
+        idx := array.size(ctf_keys_ts) - 1
+    idx
+
+ticksToDist(priceA, priceB) =>
+    math.abs(priceA - priceB) / mintick()
+
+// FIX: gating now uses per-CTF trackers, not per-window trackers
+can_fire_entry_ctf(ctfTs, pxEnt) =>
+    int idx = f_ctf_track_ensure(ctfTs)
+    // If somehow still NA, block safely
+    if na(idx)
+        false
+    else
+        int cnt   = array.get(ctf_entryCount,  idx)
+        int lastB = array.get(ctf_lastEntryBi, idx)
+        float lastP = array.get(ctf_lastEntryPx, idx)
+
+        bool enoughSpacing = na(lastP) or ticksToDist(pxEnt, lastP) >= etf_minSpacingTicks
+        bool modeOnce      = etf_multiMode == "Once"
+        bool modePerBar    = etf_multiMode == "Per Bar"
+        bool modeCooldown  = etf_multiMode == "Cooldown M bars"
+        bool modeUpToN     = etf_multiMode == "Up to N"
+
+        (modeOnce     and cnt == 0) or        (modePerBar   and (na(lastB) or lastB < bar_index) and enoughSpacing) or        (modeCooldown and (na(lastB) or (bar_index - lastB) >= etf_cooldownBars) and enoughSpacing) or        (modeUpToN    and cnt < etf_maxPerSignal and enoughSpacing)
+
+ctf_on_entry(ctfTs, pxEnt) =>
+    int idx = f_ctf_track_ensure(ctfTs)
+    if not na(idx)
+        array.set(ctf_entryCount,  idx, array.get(ctf_entryCount, idx) + 1)
+        array.set(ctf_lastEntryBi, idx, bar_index)
+        array.set(ctf_lastEntryPx, idx, pxEnt)
+
+//=============================//
+//==== ETF Tradable Box =======//
+//=============================//
+
+show_tradable_box = input.bool(true, "Show ETF tradable box for each CTF signal?")
+box_col_long      = input.color(color.new(color.lime, 0),  "Box color (Long)")
+box_col_short     = input.color(color.new(color.red,  0),  "Box color (Short)")
+box_border        = input.color(color.new(color.silver, 0), "Box border color")
+dbg_box_events    = input.bool(true, "DEBUG: label box close events")
+
+var box[]   bx_list    = array.new_box()
+var int[]   bx_side    = array.new_int()
+var bool[]  bx_closed  = array.new_bool()
+var float[] bx_pxSig   = array.new_float()
+var float[] bx_tgtPx   = array.new_float()
+var int[]   bx_tSig    = array.new_int()
+var int[]   bx_tEnd    = array.new_int()
+
+f_any_open_box_now() =>
+    bool has = false
+    int side = 0
+    int rnow = barEnd(time)
+    int n = array.size(bx_list)
+    if n > 0
+        for i = 0 to n - 1
+            if not array.get(bx_closed, i)
+                int tSig = array.get(bx_tSig, i)
+                int tEnd = array.get(bx_tEnd, i)
+                if rnow >= tSig and (na(tEnd) or rnow <= tEnd)
+                    has := true, side := array.get(bx_side, i)
+                    break
+    [has, side]
+
+f_box_close_time(tSig0) =>
+    int _hit  = (not na(ts_hit) and ts_hit >= tSig0) ? ts_hit : na
+    int _inv  = (not na(ts_inv) and ts_inv >= tSig0) ? ts_inv : na
+    int _next = (not na(ts_sig) and ts_sig >  tSig0) ? ts_sig : na
+    int _timeout = tSig0 + area_bars * CTFS_MS
+    int _evt = f_min_int(f_min_int(_hit, _inv), _timeout)
+    _evt := f_min_int(_evt, _next)
+    _evt := na(_evt) ? _timeout : _evt
+    _evt + CTFS_MS
+
+var int last_box_sig = na
+
+// --- ETF window timeout helpers ---
+f_end_for_ctf(ts0) =>
+    int n = array.size(bx_tSig)
+    int tEnd = na
+    if n > 0
+        for bi = 0 to n - 1
+            if array.get(bx_tSig, bi) == ts0
+                tEnd := array.get(bx_tEnd, bi)
+                break
+    na(tEnd) ? f_box_close_time(ts0) : tEnd
+
+// per-window active area end times
+var int[] s_tEnd = array.new_int()
+
+// Create box
+if show_tradable_box and isETF and barstate.isconfirmed
+    [hasOpenBox, _sideDummy] = f_any_open_box_now()
+    bool sig_edge_now2 = not na(ts_sig) and ts_sig != nz(ts_sig[1])
+    if sig_edge_now2 and not hasOpenBox
+        last_box_sig := ts_sig
+        float yBottom = math.min(ctf_sigPx, ctf_target)
+        float yTop    = math.max(ctf_sigPx, ctf_target)
+        color _bgc    = ctf_dir == 1 ? color.new(box_col_long, boxTransp) : color.new(box_col_short, boxTransp)
+        int tSig0   = ts_sig
+        int tClose0 = f_box_close_time(tSig0)
+        box bx = box.new(tSig0, yTop, tClose0, yBottom, xloc = xloc.bar_time, bgcolor = _bgc, border_color = box_border)
+        array.push(bx_list,   bx)
+        array.push(bx_tSig,   tSig0)
+        array.push(bx_tEnd,   tClose0)
+        array.push(bx_side,   int(ctf_dir == 0 ? 1 : ctf_dir))
+        array.push(bx_closed, false)
+        array.push(bx_pxSig,  ctf_sigPx)
+        array.push(bx_tgtPx,  ctf_target)
+        if dbg_box_events
+            makeLabel(bar_index, yTop, "boxopen", int(ctf_dir == 0 ? 1 : ctf_dir), "")
+
+// Update/close box
+if show_tradable_box and isETF and barstate.isconfirmed
+    int nU = array.size(bx_list)
+    if nU > 0
+        int r_now3 = barEnd(time)
+        for i = 0 to nU - 1
+            if array.get(bx_closed, i)
+                continue
+            box   bx    = array.get(bx_list,  i)
+            int   tSig0 = array.get(bx_tSig,  i)
+            int   side  = array.get(bx_side,  i)
+            float pxSig = array.get(bx_pxSig, i)
+            float tgtPx = array.get(bx_tgtPx, i)
+            float yBot = math.min(pxSig, tgtPx)
+            float yTop = math.max(pxSig, tgtPx)
+            box.set_bottom(bx, yBot), box.set_top(bx, yTop)
+            box.set_bgcolor(bx, side == 1 ? color.new(box_col_long, boxTransp) : color.new(box_col_short, boxTransp))
+            box.set_border_color(bx, box_border)
+            int tCloseRecalc = f_box_close_time(tSig0)
+            int tClosePrev   = array.get(bx_tEnd, i)
+            int tCloseFinal  = na(tClosePrev) ? tCloseRecalc : math.min(tClosePrev, tCloseRecalc)
+            array.set(bx_tEnd, i, tCloseFinal)
+            int r_target = math.max(tSig0, math.min(r_now3, tCloseFinal))
+            box.set_right(bx, r_target)
+            if r_now3 >= tCloseFinal
+                array.set(bx_closed, i, true)
+                box.set_right(bx, tCloseFinal)
+                if dbg_box_events
+                    string why =
+                         (not na(ts_hit) and tCloseFinal - CTFS_MS == ts_hit) ? "Hit" :
+                         (not na(ts_inv) and tCloseFinal - CTFS_MS == ts_inv) ? "Invalid" :
+                         (not na(ts_sig) and tCloseFinal - CTFS_MS == ts_sig) ? "New Sig" : "Timeout"
+                    makeLabel(bar_index, yTop, "boxclose", 0, why)
+
+// On box-close, mark ONLY matching ETF windows done (FIX: stop killing all windows globally)
+if show_tradable_box and isETF and barstate.isconfirmed
+    int nC = array.size(bx_list)
+    if nC > 0
+        int rNowBar = barEnd(time)
+        for bi = 0 to nC - 1
+            bool closedThisBar = array.get(bx_closed, bi) and array.get(bx_tEnd, bi) == rNowBar
+            if closedThisBar
+                int tSigClosed = array.get(bx_tSig, bi)
+                int szW = array.size(s_done)
+                int limW = math.min(szW, array.size(s_ctfSigTs)) - 1
+                if limW >= 0
+                    for wi = 0 to limW
+                        if not array.get(s_done, wi) and array.get(s_ctfSigTs, wi) == tSigClosed
+                            array.set(s_done, wi, true)
+
+//=============================//
+//======== ETF WINDOWS =========//
+//=========== Logic ============//
+//=============================//
+
+// New ETF window on signal
+if etf_sigEdge and etfInBacktest
+    etf_sigEval += 1
+    array.push(s_time,  time)
+    array.push(s_ctfSigTs, ts_sig)  // store CTF signal time (ms)
+
+    int tEndW = f_end_for_ctf(ts_sig)
+    array.push(s_tEnd, tEndW)
+
+    array.push(s_side,  etf_sigP)
+    array.push(s_close, close)
+    array.push(s_open,  open)
+    array.push(s_bs,    0)
+    array.push(s_pbOK,  false)
+    array.push(s_entered, false)
+    array.push(s_touched, false)
+    array.push(s_done,  false)
+    array.push(s_pbOK_bi, na)
+    array.push(s_armed,   false)
+    // init per-window entry control (legacy, preserved)
+    array.push(s_entryCount,  0)
+    array.push(s_lastEntryBi, na)
+    array.push(s_lastEntryPx, na)
+
+    // ensure CTF trackers exist for this CTF signal (multi-entry per CTF)
+    f_ctf_track_ensure(ts_sig)
+
+    makeLabel(bar_index, close, "sig", etf_sigP, "Close " + pfmt(close))
+
+// advance window clocks
+if isETF and barstate.isconfirmed
+    szS = array.size(s_time)
+    if szS > 0
+        for i = 0 to szS - 1
+            if i < array.size(s_done) and i < array.size(s_bs)
+                if not array.get(s_done, i) and array.get(s_time, i) != time
+                    array.set(s_bs, i, array.get(s_bs, i) + 1)
+
+// kill windows on new CTF signal
+var int _last_sig_ts = na
+if isETF and barstate.isconfirmed
+    if not na(ts_sig) and ts_sig != _last_sig_ts
+        _sz_reset = array.size(s_done)
+        if _sz_reset > 0
+            for i = 0 to _sz_reset - 1
+                if not array.get(s_done, i)
+                    array.set(s_done, i, true)
+        _last_sig_ts := ts_sig
+
+// kill windows when CTF inactive (FIX: use ctf_active_final, not ctf_active_chart)
+if isETF and barstate.isconfirmed
+    if not ctf_active_final
+        szS_kill = array.size(s_time)
+        if szS_kill > 0
+            for i = 0 to szS_kill - 1
+                if i < array.size(s_done) and not array.get(s_done, i)
+                    array.set(s_done, i, true)
+
+// single-pass evaluate ETF windows
+if isETF and show_mod2 and barstate.isconfirmed
+    pullNeeded = pullbackAtr * etf_atr
+    szS2 = array.size(s_time)
+    if szS2 > 0
+        lim = math.min(math.min(math.min(math.min(math.min(szS2, array.size(s_done)), array.size(s_bs)), array.size(s_open)), array.size(s_close)), array.size(s_side)) - 1
+        if lim >= 0
+            for i = 0 to lim
+                if array.get(s_done, i)
+                    continue
+
+                side    = array.get(s_side,  i)
+                pxEnt   = array.get(s_close, i)
+                pxOpen  = array.get(s_open,  i)
+                bs      = array.get(s_bs,    i)
+                pbOk    = array.get(s_pbOK,  i)
+                entered = array.get(s_entered, i)
+
+                // --- Resolve the CTF box for this ETF window (stable CTF direction) ---
+                int sigCTF = array.get(s_ctfSigTs, i)
+                int bIdx = na
+                int nB = array.size(bx_tSig)
+                if nB > 0
+                    for bi = 0 to nB - 1
+                        if array.get(bx_tSig, bi) == sigCTF
+                            bIdx := bi
+                            break
+
+                int sideCTF = side
+                float midPxWin = na
+                if not na(bIdx)
+                    sideCTF := array.get(bx_side, bIdx)
+                    float sigPxWin = array.get(bx_pxSig, bIdx)
+                    float tgtPxWin = array.get(bx_tgtPx, bIdx)
+                    midPxWin := (sigPxWin + tgtPxWin) / 2.0
+                else
+                    // fallback (should rarely happen if boxes are created correctly)
+                    sideCTF := (ctf_dir != 0) ? int(ctf_dir) : side
+
+                bool tradeAlignCTF = (side == sideCTF)
+
+                lenWin  = bs + 1
+                lenEff  = safeLen(lenWin)
+                lenValid = math.min(lenEff, bar_index + 1)
+
+                hiRun = bar_index + 1 >= lenValid ? ta.highest(high, lenValid) : na
+                loRun = bar_index + 1 >= lenValid ? ta.lowest (low,  lenValid) : na
+                touchedNow = side == 1 ? (hiRun >= pxEnt) : (loRun <= pxEnt)
+                if touchedNow and not array.get(s_touched, i)
+                    array.set(s_touched, i, true)
+
+                // PB detection (after signal bar)
+                if not pbOk and bs >= 1
+                    bool pbDirOK = not pb_require_opposite_close or (sideCTF == 1 ? close < open : close > open)
+                    float refHi = pb_use_close ? close : high
+                    float refLo = pb_use_close ? close : low
+                    float pullNeedStrict = math.max(pullNeeded, mintick())  // at least 1 tick beyond signal
+                    bool pbNow = (sideCTF == 1 and refLo < pxEnt - pullNeedStrict) or                        (sideCTF == -1 and refHi > pxEnt + pullNeedStrict)
+
+                    if pbDirOK and pbNow
+                        array.set(s_pbOK,    i, true)
+                        array.set(s_pbOK_bi, i, bar_index)
+                        makeLabel(bar_index, side == 1 ? refLo : refHi, "pb", side, str.format("SignalPx {0}\nMoved ≥ {1} ATR away", pfmt(pxEnt), str.tostring(pullbackAtr, "#.##")))
+                pbOk := array.get(s_pbOK, i)
+
+                // early close: no PB within M
+                if not pbOk and bs == pb_must_within_bars
+                    _touched = array.get(s_touched, i)
+                    if enable_bt_calc and etfInBacktest
+                        etf_noEntry += 1
+                        if _touched
+                            etf_touched_total += 1
+                            etf_touched_noEntry += 1
+                    array.set(s_done, i, true)
+                    makeLabel(bar_index, pxEnt, "nopb", side, "SignalPx " + pfmt(pxEnt))
+                    continue
+
+                // arming after PB
+                bool armed = array.get(s_armed, i)
+                if enter_after_pb and pbOk and not armed
+                    array.set(s_armed, i, true)
+                    armed := true
+
+                // retest condition AFTER PB
+                bool backTouch  = sideCTF == 1 ? (high >= pxEnt) : (low <= pxEnt)
+                bool backClose  = sideCTF == 1 ? (close >= pxEnt) : (close <= pxEnt)
+                bool backToSignal = (fillPolicy == "Touch") ? backTouch : backClose
+
+                int  pbBi = array.get(s_pbOK_bi, i)
+                bool waitedAfterPB = not na(pbBi) and (bar_index - pbBi) >= min_pb_wait_bars
+                // Retest MUST be same direction as CTF box direction (always enforced)
+                bool retestDirOK = (sideCTF == 1 ? close > open : close < open)
+                bool resumeOk = retestDirOK and (not require_resume_cndl or retestDirOK)  // keeps UI input but doesn't weaken the rule
+
+                // Age filter (how many bars since ETF signal)
+                bool age_ok = (array.get(s_bs, i) <= max_sig_age)
+
+                // --- Get the per-window midpoint (from the matching CTF box if available) ---
+                //int sigCTF = array.get(s_ctfSigTs, i)
+
+                //float midPxWin = na
+                //float sigPxWin = na
+                //float tgtPxWin = na
+                // int nB = array.size(bx_tSig)
+                // if nB > 0 and not na(sigCTF)
+                //     int bIdx = na
+                //     for bi = 0 to nB - 1
+                //         if array.get(bx_tSig, bi) == sigCTF
+                //             bIdx := bi
+                //             break
+                //     if not na(bIdx)
+                //         sigPxWin := array.get(bx_pxSig, bIdx)
+                //         tgtPxWin := array.get(bx_tgtPx, bIdx)
+                //         midPxWin := (sigPxWin + tgtPxWin) / 2.0
+
+                // fallback midpoint if boxes are off / not found
+                if na(midPxWin)
+                    midPxWin := (ctf_sigPx + ctf_target) / 2.0
+
+                // --- HALF-BY-PRICE gate ---
+                float probePx = fillPolicy == "Touch" ? (side == 1 ? low : high) : close
+                bool price_half_ok = (not restrict_first_half_price) or na(midPxWin) or (side == 1 ? (probePx <= midPxWin) : (probePx >= midPxWin))
+
+                // --- Determine TP box-edge for THIS window (from matched CTF box) ---
+                float tpBoxHere = na
+                if not na(bIdx)
+                    float sigPxWin = array.get(bx_pxSig, bIdx)
+                    float tgtPxWin = array.get(bx_tgtPx, bIdx)
+                    float yBottomW = math.min(sigPxWin, tgtPxWin)
+                    float yTopW    = math.max(sigPxWin, tgtPxWin)
+                    tpBoxHere := sideCTF == 1 ? yTopW : yBottomW
+                else
+                    // fallback if box not found
+                    tpBoxHere := sideCTF == 1 ? math.max(ctf_sigPx, ctf_target) : math.min(ctf_sigPx, ctf_target)
+
+                // --- Compute "R" from your SL anchor (signal candle open +/- buffer) ---
+                float slBuf = ticksToPrice(slBufTicks)
+                float slTmp = sideCTF == 1 ? (pxOpen - slBuf) : (pxOpen + slBuf)
+                float Rtmp  = math.max(math.abs(pxEnt - slTmp), mintick())
+
+                // --- Potential reward in R to TP ---
+                float potentialR = (tpBoxHere - pxEnt) * sideCTF / Rtmp
+
+                // Only take trades whose TP is at least min_rr_to_take R away
+                bool rr_ok = not na(tpBoxHere) and (potentialR >= min_rr_to_take)
+
+                // FIX: multi-entry gating is per CTF signal (sigCTF), not per ETF window index
+                bool fireNow = etfInBacktest and act_gate and in_box_ok and price_half_ok and age_ok and tradeAlignCTF and not entered and   rr_ok and                 (                        (enter_after_pb and pbOk and waitedAfterPB and backToSignal and resumeOk) or                        (not enter_after_pb and resumeOk and (sideCTF == 1 ? high >= pxEnt : low <= pxEnt))                    ) and can_fire_entry_ctf(sigCTF, pxEnt)
+
+                if fireNow
+                    // open trade
+                    array.push(a_entry,  pxEnt)
+
+                    // SL anchored to SIGNAL candle OPEN (+ buffer), and 1R = |entry - SL|
+                    float slBuf = ticksToPrice(slBufTicks)
+                    float sl    = side == 1 ? (pxOpen - slBuf) : (pxOpen + slBuf)
+                    float R     = math.max(math.abs(pxEnt - sl), mintick())
+
+
+                    // === TP MODE ENFORCEMENT (BOX EDGE ONLY) ===
+                    // TP is forced to far edge of the CTF box: LONG=max(sigPx,target), SHORT=min(sigPx,target)
+                    float tpBoxHere = side == 1 ? math.max(ctf_sigPx, ctf_target) : math.min(ctf_sigPx, ctf_target)
+
+                    // store trade
+                    array.push(a_sl,     sl)
+                    array.push(a_tp,     tpBoxHere)      // keep slot populated (visual parity when UI expects a TP level)
+                    array.push(a_side,   side)
+                    array.push(a_state,  0)
+                    array.push(a_openBi, bar_index)
+                    array.push(a_beSet,  false)
+                    array.push(a_Rsize,  R)
+                    array.push(a_partial,1.0)
+                    array.push(a_sigIdx, i)
+                    array.push(a_accounted, false)
+
+                    // Store Box-edge TP per trade (authoritative for accounting/hits)
+                    array.push(a_tpBox, tpBoxHere)
+
+                    // visuals (keep existing label kinds; make TP level reflect box-edge if it was drawn before)
+                    makeLabel(bar_index, pxEnt, "entry", side, "Retest of SignalPx " + pfmt(pxEnt))
+
+                    // Visual parity: only draw tplvl if the current script would have drawn it (RR mode UI),
+                    // but the level is forced to box-edge.
+                    bool rrModeNow_UI = (tp_mode == "R Multiple")
+                    if rrModeNow_UI
+                        makeLabel(bar_index, tpBoxHere, "tplvl", side, pfmt(tpBoxHere))
+
+                    makeLabel(bar_index, sl, "sllvl", side, pfmt(sl))
+
+                    // update per-CTF entry tracking (core fix)
+                    ctf_on_entry(sigCTF, pxEnt)
+
+                    // keep legacy per-window fields for stats/UI (NOT used for gating anymore)
+                    array.set(s_entryCount,  i, array.get(s_entryCount, i) + 1)
+                    array.set(s_lastEntryBi, i, bar_index)
+                    array.set(s_lastEntryPx, i, pxEnt)
+                    array.set(s_entered, i, true)  // window had at least one entry (for window-end stats only)
+
+                // window timeout by ACTIVE-AREA end
+                int tEndW2 = array.get(s_tEnd, i)
+                bool windowEnded = barEnd(time) >= tEndW2
+                if windowEnded
+                    _entered = array.get(s_entered, i)
+                    _touched = array.get(s_touched, i)
+                    if enable_bt_calc and etfInBacktest
+                        if not _entered
+                            makeLabel(bar_index, pxEnt, "autoclose", side, "No Entry (active area end)")
+                            etf_noEntry += 1
+                            if _touched
+                                etf_touched_total += 1
+                                etf_touched_noEntry += 1
+                        else
+                            if _touched
+                                etf_touched_total += 1
+                    array.set(s_done, i, true)
+
+//=============================//
+//======== MODULE 3 ===========//
+//== Trade Management (ETF) ===//
+//=============================//
+
+// ---------- Inputs ----------
+tp_partials_on   = input.bool(false, "Enable multi-target partial TPs?")
+tp_targetsN      = input.int(2, "Number of TP targets (0..3)", minval=0, maxval=3)
+tp_pct_rel_rem   = input.bool(true, "Partial % of remaining (else of initial)?")
+tp1_on  = input.bool(true,  "TP1 enabled?")
+tp1_R   = input.float(1.0,  "TP1 at +R", step=0.1, minval=0.1)
+tp1_pct = input.float(50.0, "TP1 %", step=1, minval=1, maxval=95)
+tp2_on  = input.bool(true,  "TP2 enabled?")
+tp2_R   = input.float(2.0,  "TP2 at +R", step=0.1, minval=0.1)
+tp2_pct = input.float(25.0, "TP2 %", step=1, minval=1, maxval=95)
+tp3_on  = input.bool(false, "TP3 enabled?")
+tp3_R   = input.float(3.0,  "TP3 at +R", step=0.1, minval=0.1)
+tp3_pct = input.float(25.0, "TP3 %", step=1, minval=1, maxval=95)
+
+trail_mode           = input.string("None", "Trailing stop mode", options=["None","ATR","Structure HL","Step R"])
+trail_after_be_only  = input.bool(true, "Apply trailing only after BE?")
+atrTrailMult         = input.float(1.5, "ATR trail × (ETF ATR)", step=0.1, minval=0.1)
+struct_lookback      = input.int(2, "Structure HL lookback (bars)", minval=1)
+struct_buf_ticks     = input.int(0, "Structure SL buffer (ticks)")
+trail_stepN          = input.int(2, "Step-R: number of steps (0..3)", minval=0, maxval=3)
+step1_trigger_R      = input.float(1.0, "Step1 trigger at +R", step=0.1, minval=0.1)
+step1_sl_R           = input.float(0.5, "Step1 SL to +R", step=0.1, minval=0.0)
+step2_trigger_R      = input.float(2.0, "Step2 trigger at +R", step=0.1, minval=0.1)
+step2_sl_R           = input.float(1.0, "Step2 SL to +R", step=0.1, minval=0.0)
+step3_trigger_R      = input.float(3.0, "Step3 trigger at +R", step=0.1, minval=0.1)
+step3_sl_R           = input.float(2.0, "Step3 SL to +R", step=0.1, minval=0.0)
+
+time_stop_bars = input.int(0, "Time-stop per trade (ETF bars, 0=off)", minval=0)
+flip_action    = input.string("Close", "On CTF context flip", options=["Close","Ignore"])
+slip_exit_ticks   = input.int(0, "Slippage (exit, adverse) ticks", minval=0)
+fee_prorata_exits = input.bool(true, "Prorate feeR across partial exits?")
+
+box_end_settle       = input.string("Realized R", "Box End settlement", options=["Realized R","Force BE","BE if within X ticks"])
+box_end_be_tol_ticks = input.int(1, "BE-if-within: tolerance (ticks)", minval=0)
+
+// ---------- Per-trade partials ----------
+var bool[]  a_t1_hit = array.new_bool()
+var bool[]  a_t2_hit = array.new_bool()
+var bool[]  a_t3_hit = array.new_bool()
+var float[] a_t1_px  = array.new_float()
+var float[] a_t2_px  = array.new_float()
+var float[] a_t3_px  = array.new_float()
+var float[] a_realR_acc = array.new_float()
+
+// ---------- Helpers ----------
+partial_of(rem, pct) =>
+    tp_pct_rel_rem ? (rem * (pct/100.0)) : (pct/100.0)
+
+bt_book_partial(i, exitFrac, realizedR) =>
+    if bt_enabled()
+        R = array.get(a_Rsize, i)
+        slipR = (ticksToPrice(slip_exit_ticks)) / math.max(R, mintick())
+        rDelta = exitFrac * (realizedR - slipR) - (feeR * (fee_prorata_exits ? exitFrac : 0.0))
+        bt_add(0, 0, 0, rDelta)
+        accPrev = i < array.size(a_realR_acc) ? array.get(a_realR_acc, i) : 0.0
+        if i >= array.size(a_realR_acc)
+            for _f = array.size(a_realR_acc) to i
+                array.push(a_realR_acc, 0.0)
+        array.set(a_realR_acc, i, accPrev + rDelta)
+
+bt_settle_trade(i, result_case) =>
+    if array.get(a_accounted, i)
+        na
+    else
+        pos  = array.get(a_partial, i)
+        R    = array.get(a_Rsize, i)
+        px   = array.get(a_entry, i)
+        side = array.get(a_side, i)
+        rRealClose = (close - px) * side / math.max(R, mintick())
+        slipR = (ticksToPrice(slip_exit_ticks)) / math.max(R, mintick())
+        rBase =
+             result_case == 1 ? (pos * rr_tp) :
+             result_case == -1 ? (pos * -1.0) :
+             result_case == 2 ? (pos * 0.0) :
+             (pos * rRealClose)
+        rDelta = rBase - (pos * slipR) - (feeR * (fee_prorata_exits ? pos : 1.0))
+        isBE = (result_case == 2) or (math.abs(rBase) <= 1e-10 and math.abs(rDelta) <= 1e-10)
+        bt_add(isBE ? 0 : (rDelta > 0 ? 1 : 0), isBE ? 0 : (rDelta < 0 ? 1 : 0), isBE ? 1 : 0, rDelta)
+        array.set(a_accounted, i, true)
+
+// Context dir snapshot
+ctfCtxNow = ctf_dir
+
+// === ENFORCEMENTS (logic only; UI preserved) ===
+string tp_mode_eff = "Box Edge"  // forced
+bool be_mode_eff = false         // forced OFF (skip BE)
+bool trail_eff   = false         // forced OFF (skip trailing)
+bool tp_partials_eff = false     // forced OFF (single TP only)
+
+if isETF and show_mod3 and barstate.isconfirmed
+    
+    // Normal management (next bar after entry)
+    sz = array.size(a_entry)
+    if sz > 0
+        for k = 0 to sz - 1
+            i = sz - 1 - k
+            if array.get(a_state, i) != 0
+                continue
+
+            side   = array.get(a_side,  i)
+            px     = array.get(a_entry, i)
+            sl     = array.get(a_sl,    i)
+            // tp is present but TP is forced via a_tpBox (box edge)
+            tp     = array.get(a_tp,    i)
+            R      = array.get(a_Rsize, i)
+            beSet  = array.get(a_beSet, i)
+            pos    = array.get(a_partial, i)
+            openBi = array.get(a_openBi, i)
+            bool canEvalNext = bar_index > openBi
+            bool canEvalTP   = canEvalNext or (eval_on_entry_bar and bar_index == openBi)
+            bool canEvalSL   = canEvalNext or (eval_on_entry_bar and bar_index == openBi)
+            bool canEvalBE   = canEvalNext  // BE never on entry bar
+
+            // ---------- Time stop ----------
+            if time_stop_bars > 0 and (bar_index - openBi) >= time_stop_bars
+                makeLabel(bar_index, close, "autoclose", side, "Time stop")
+                if verbose_labels
+                    makeLabel(bar_index, close, "res_be", side, "Time stop")
+                array.set(a_state, i, 3)
+                if enable_bt_calc and etfInBacktest
+                    bt_settle_trade(i, 3)
+                continue
+
+            // ---------- Break-Even (FORCED OFF) ----------
+            if be_mode_eff
+                // never executes
+                na
+
+            // ---------- Trailing logic (FORCED OFF) ----------
+            if trail_eff
+                // never executes
+                na
+
+            // ---------- Multi-target partial TPs (FORCED OFF for single TP model) ----------
+            if tp_partials_eff and array.get(a_state, i) == 0
+                // never executes
+                na
+
+            // ---------- TP/SL resolution (FORCED Box Edge ONLY) ----------
+            bool boxEdgeMode = true
+
+            float tpBoxTrade = array.get(a_tpBox, i)
+            // fallback if missing for any reason (should not happen after entry fix)
+            if na(tpBoxTrade)
+                tpBoxTrade := side == 1 ? math.max(ctf_sigPx, ctf_target) : math.min(ctf_sigPx, ctf_target)
+
+            bool hitTP = boxEdgeMode and canEvalTP and not na(tpBoxTrade) and (side == 1 ? high >= tpBoxTrade : low <= tpBoxTrade)
+            bool hitSL =               canEvalSL and (side == 1 ? low  <= sl        : high >= sl)
+
+            // Resolve ties (MUST match tieMode)
+            int exitCase = 0
+            if hitTP and hitSL
+                exitCase := (tieMode == "Optimistic") ? 1 : -1
+            else if hitTP
+                exitCase := 1
+            else if hitSL
+                exitCase := -1
+
+            if exitCase != 0
+                if exitCase == 1
+                    float tp_px = tpBoxTrade
+                    makeLabel(bar_index, tp_px, "tp", side, "TP @ Box Edge " + pfmt(tp_px))
+                    if verbose_labels
+                        makeLabel(bar_index, tp_px, "res_hit", side, "")
+                    array.set(a_state, i, 1)
+
+                    // Backtest accounting at ACTUAL TP price (box edge)
+                    if enable_bt_calc and etfInBacktest
+                        pos2  = array.get(a_partial, i)
+                        Rsz   = array.get(a_Rsize, i)
+                        pxEn  = array.get(a_entry, i)
+                        slipR = (ticksToPrice(slip_exit_ticks)) / math.max(Rsz, mintick())
+                        rReal = (tp_px - pxEn) * side / math.max(Rsz, mintick())
+                        rDelta = pos2 * (rReal - slipR) - (feeR * (fee_prorata_exits ? pos2 : 1.0))
+                        bt_add((rDelta>0?1:0),(rDelta<0?1:0),(math.abs(rReal)<=1e-10?1:0), rDelta)
+                        array.set(a_accounted, i, true)
+                else
+                    makeLabel(bar_index, sl, "sl", side, "SL @ " + pfmt(sl))
+                    if verbose_labels
+                        if math.abs(sl - px) <= mintick()*0.5
+                            makeLabel(bar_index, sl, "res_be", side, "")
+                        else
+                            makeLabel(bar_index, sl, "res_fail", side, "")
+                    if math.abs(sl - px) <= mintick()*0.5
+                        array.set(a_state, i, 2)
+                        if enable_bt_calc and etfInBacktest
+                            bt_settle_trade(i, 2)
+                    else
+                        array.set(a_state, i, -1)
+                        if enable_bt_calc and etfInBacktest
+                            bt_settle_trade(i, -1)
+
+            // ---------- Exit on Context Flip (optional) ----------
+            if array.get(a_state, i) == 0 and (ctfCtxNow != 0 and ctfCtxNow != side) and canEvalBE
+                if flip_action == "Close"
+                    makeLabel(bar_index, close, "autoclose", side, "Context flipped")
+                    if verbose_labels
+                        makeLabel(bar_index, close, "res_be", side, "Context flip")
+                    array.set(a_state, i, 3)
+                    if enable_bt_calc and etfInBacktest
+                        bt_settle_trade(i, 3)
+    // Close trades when their ETF window ends
+    szS3 = array.size(s_time)
+    if szS3 > 0
+        limS = math.min(szS3, array.size(s_done)) - 1
+        if limS >= 0
+            for wi = 0 to limS
+                if array.get(s_done, wi)
+                    szT = array.size(a_entry)
+                    if szT > 0
+                        limT = math.min(szT, math.min(array.size(a_state), array.size(a_sigIdx))) - 1
+                        if limT >= 0
+                            for ti = 0 to limT
+                                if array.get(a_state, ti) == 0 and array.get(a_sigIdx, ti) == wi
+                                    // Box End path is disabled by TP enforcement
+                                    if tp_mode_eff == "Box End"
+                                        // (kept for UI parity; never executes)
+                                        na
+                                    else
+                                        array.set(a_state, ti, 3)
+                                        makeLabel(bar_index, close, "autoclose", array.get(a_side, ti), "")
+                                        if verbose_labels
+                                            makeLabel(bar_index, close, "res_be", array.get(a_side, ti), "Auto-close / Mixed")
+                                        if enable_bt_calc and etfInBacktest
+                                            bt_settle_trade(ti, 3)
+
+//=============================//
+//======== MODULE 5 ===========//
+//======== Result Tables ======//
+//=============================//
+
+// CTF table
+var table ctfTbl = na
+if show_mod5 and isCTF
+    if na(ctfTbl)
+        ctfTbl := table.new(position.top_right, 2, 7, border_width=1)
+    if barstate.islastconfirmedhistory
+        ctf_failCount := ctf_invalidCount + ctf_timeoutFailCount
+        succ    = ctf_sigCount > 0 ? (100.0 * ctf_hitCount / (ctf_timeoutFailCount+ctf_hitCount)) : na
+        failPct = ctf_sigCount > 0 ? (100.0 * ctf_timeoutFailCount / (ctf_timeoutFailCount+ctf_hitCount)) : na
+        table.cell(ctfTbl, 0, 0, "CTF", text_color=color.white, bgcolor=color.new(color.black, 0))
+        table.cell(ctfTbl, 1, 0, "Stats", text_color=color.white, bgcolor=color.new(color.black, 0))
+        table.cell(ctfTbl, 0, 1, "Signals"), table.cell(ctfTbl, 1, 1, str.tostring(ctf_sigCount))
+        table.cell(ctfTbl, 0, 2, "Hits"),    table.cell(ctfTbl, 1, 2, str.tostring(ctf_hitCount))
+        table.cell(ctfTbl, 0, 3, "Invalids"),table.cell(ctfTbl, 1, 3, str.tostring(ctf_invalidCount))
+        table.cell(ctfTbl, 0, 4, "Fails")   , table.cell(ctfTbl, 1, 4, str.tostring(ctf_timeoutFailCount))
+        table.cell(ctfTbl, 0, 5, "Fails (All)"), table.cell(ctfTbl, 1, 5, str.tostring(ctf_failCount))
+        comb = (na(succ) or na(failPct)) ? "—" : str.format("{0}% / {1}%", str.tostring(succ, "#.0"), str.tostring(failPct, "#.0"))
+        table.cell(ctfTbl, 0, 6, "Success % / Fail %"), table.cell(ctfTbl, 1, 6, comb)
+
+// ETF table
+var table etfTbl = na
+if show_mod5 and isETF
+    if na(etfTbl)
+        etfTbl := table.new(position.top_right, 2, 11, border_width=1)
+
+    if barstate.isconfirmed
+        [w, l, beCnt, tR] = bt_totals()
+        entries  = w + l + beCnt
+        winPct   = entries > 0 ? (100.0 * w / entries) : na
+        avgR     = entries > 0 ? (tR / entries) : na
+        accounted = etf_noEntry + etf_touched_total
+
+        table.cell(etfTbl, 0, 0, "ETF",   text_color=color.white, bgcolor=color.new(color.black, 0))
+        table.cell(etfTbl, 1, 0, "Stats", text_color=color.white, bgcolor=color.new(color.black, 0))
+
+        table.cell(etfTbl, 0, 1, "Signals eval")
+        table.cell(etfTbl, 1, 1, str.tostring(etf_sigEval))
+
+        table.cell(etfTbl, 0, 2, "No PB / No Entry")
+        table.cell(etfTbl, 1, 2, str.tostring(etf_noEntry))
+
+        table.cell(etfTbl, 0, 3, "Touched entry level")
+        table.cell(etfTbl, 1, 3, str.tostring(etf_touched_total))
+
+        table.cell(etfTbl, 0, 4, "Touched but Blocked")
+        table.cell(etfTbl, 1, 4, str.tostring(etf_touched_noEntry))
+
+        table.cell(etfTbl, 0, 5, "Entries (trades)")
+        table.cell(etfTbl, 1, 5, str.format("{0}", entries))
+
+        table.cell(etfTbl, 0, 6, "Wins / Losses / BE")
+        table.cell(etfTbl, 1, 6, str.format("{0} / {1} / {2}", w, l, beCnt))
+
+        table.cell(etfTbl, 0, 7, "Win %")
+        table.cell(etfTbl, 1, 7, na(winPct) ? "—" : str.tostring(winPct, "#.0"))
+
+        table.cell(etfTbl, 0, 8, "Total R")
+        table.cell(etfTbl, 1, 8, str.tostring(tR, "#.00"))
+
+        table.cell(etfTbl, 0, 9, "Avg R")
+        table.cell(etfTbl, 1, 9, na(avgR) ? "—" : str.tostring(avgR, "#.00"))
+
+        table.cell(etfTbl, 0, 10, "Acct check (NoEntry+Touched)")
+        table.cell(etfTbl, 1, 10, str.format("{0} / {1}", accounted, etf_sigEval))
